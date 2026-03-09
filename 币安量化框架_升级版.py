@@ -39,6 +39,14 @@ class TradingEngine:
         
         # ================== 风险控制模块 ==================
         self.risk_config = {
+            # 风控开关（可选择性开启）
+            'enable_risk_control': True,              # 总风控开关
+            'enable_per_trade_limit': True,           # 单笔交易风险限制
+            'enable_daily_loss_limit': True,          # 单日最大亏损限制
+            'enable_drawdown_limit': True,            # 最大回撤限制
+            'enable_position_limit': True,            # 单一币种仓位限制
+            'enable_price_fluctuation_limit': True,   # 价格异常波动限制
+            
             # 基础风控参数
             'max_risk_per_trade': 0.02,      # 单笔交易最大风险 2%本金
             'max_daily_loss': 0.1,           # 单日最大亏损 10%本金
@@ -85,6 +93,9 @@ class TradingEngine:
         
         # 初始化交易所
         self.init_exchange()
+        
+        # 初始化风控配置
+        self.update_risk_config()
 
     def init_exchange(self):
         """初始化交易所API"""
@@ -135,20 +146,28 @@ class TradingEngine:
             self.log("❌ 交易已被禁用，拒绝执行信号")
             return False
         
-        # 最大回撤检查
-        if self.risk_config['current_drawdown'] >= self.risk_config['max_drawdown']:
+        # 总风控开关，关闭则跳过所有检查
+        if not self.risk_config['enable_risk_control']:
+            self.log("⚠️  风控总开关已关闭，跳过所有风险检查")
+            return True
+        
+        # 最大回撤检查（可选）
+        if self.risk_config['enable_drawdown_limit'] and \
+           self.risk_config['current_drawdown'] >= self.risk_config['max_drawdown']:
             self.log(f"❌ 触发最大回撤限制: 当前回撤{self.risk_config['current_drawdown']:.2%} >= 限制{self.risk_config['max_drawdown']:.2%}")
             self.emergency_stop("最大回撤触发")
             return False
         
-        # 单日最大亏损检查
-        if self.risk_config['daily_loss'] >= self.risk_config['max_daily_loss']:
+        # 单日最大亏损检查（可选）
+        if self.risk_config['enable_daily_loss_limit'] and \
+           self.risk_config['daily_loss'] >= self.risk_config['max_daily_loss']:
             self.log(f"❌ 触发单日最大亏损限制: 当日亏损{self.risk_config['daily_loss']:.2%} >= 限制{self.risk_config['max_daily_loss']:.2%}")
             self.emergency_stop("单日最大亏损触发")
             return False
         
-        # 价格异常波动检查
-        if price and len(self.data_queue) > 1:
+        # 价格异常波动检查（可选）
+        if self.risk_config['enable_price_fluctuation_limit'] and \
+           price and len(self.data_queue) > 1:
             last_price = self.data_queue[-1][1]
             fluctuation = abs(price - last_price) / last_price
             if fluctuation >= self.risk_config['price_fluctuation_limit']:
@@ -157,19 +176,23 @@ class TradingEngine:
         
         # 开仓前检查
         if signal in ["做多", "做空"] and self.position['side'] == 'empty':
-            # 单笔风险检查
-            position_size = self.calculate_position_size(price, signal)
-            max_allowed_size = self.risk_config['current_capital'] * self.risk_config['max_risk_per_trade'] / price
-            if position_size > max_allowed_size:
-                self.log(f"❌ 触发单笔风险限制: 计算仓位{position_size:.4f} > 最大允许{max_allowed_size:.4f}")
-                return False
+            # 单笔风险检查（可选）
+            if self.risk_config['enable_per_trade_limit']:
+                position_size = self.calculate_position_size(price, signal)
+                max_allowed_size = self.risk_config['current_capital'] * self.risk_config['max_risk_per_trade'] / price
+                if position_size > max_allowed_size:
+                    self.log(f"❌ 触发单笔风险限制: 计算仓位{position_size:.4f} > 最大允许{max_allowed_size:.4f}")
+                    return False
             
-            # 单一币种仓位限制
-            position_value = position_size * price
-            max_allowed_value = self.risk_config['current_capital'] * self.risk_config['max_position_per_symbol']
-            if position_value > max_allowed_value:
-                self.log(f"❌ 触发单一币种仓位限制: 仓位价值{position_value:.2f} > 最大允许{max_allowed_value:.2f}")
-                return False
+            # 单一币种仓位限制（可选）
+            if self.risk_config['enable_position_limit']:
+                position_size = self.calculate_position_size(price, signal) if self.risk_config['enable_per_trade_limit'] else \
+                               (self.risk_config['current_capital'] * 0.95 / price * float(self.leverage_entry.get()))
+                position_value = position_size * price
+                max_allowed_value = self.risk_config['current_capital'] * self.risk_config['max_position_per_symbol']
+                if position_value > max_allowed_value:
+                    self.log(f"❌ 触发单一币种仓位限制: 仓位价值{position_value:.2f} > 最大允许{max_allowed_value:.2f}")
+                    return False
         
         return True
     
@@ -199,6 +222,24 @@ class TradingEngine:
         
         # 发送告警
         self.send_alert(f"紧急停止触发: {reason}", "high")
+    
+    def update_risk_config(self):
+        """从界面更新风控配置"""
+        self.risk_config['enable_risk_control'] = self.risk_enable_var.get()
+        self.risk_config['enable_per_trade_limit'] = self.per_trade_var.get()
+        self.risk_config['enable_daily_loss_limit'] = self.daily_loss_var.get()
+        self.risk_config['enable_drawdown_limit'] = self.drawdown_var.get()
+        self.risk_config['enable_position_limit'] = self.position_var.get()
+        self.risk_config['enable_price_fluctuation_limit'] = self.price_var.get()
+        
+        status = "✅ 已启用" if self.risk_config['enable_risk_control'] else "❌ 已禁用"
+        self.log(f"风险控制配置更新: 总开关{status}")
+        
+        # 更新按钮状态
+        if self.risk_config['enable_risk_control']:
+            self.emergency_btn.config(state="normal")
+        else:
+            self.emergency_btn.config(state="disabled")
     
     def send_alert(self, message, level="normal"):
         """发送告警通知"""
@@ -240,6 +281,41 @@ class TradingEngine:
         
         self.live_btn = ttk.Button(engine_frame, text="实盘引擎", command=lambda: self.switch_engine(2))
         self.live_btn.pack(side="left", padx=5, pady=5)
+        
+        # ================== 风控设置面板 ==================
+        risk_frame = ttk.LabelFrame(left_frame, text="风险控制设置")
+        risk_frame.pack(fill="x", padx=5, pady=5)
+        
+        # 总风控开关
+        self.risk_enable_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="启用风险控制", variable=self.risk_enable_var, 
+                       command=self.update_risk_config).grid(row=0, column=0, padx=5, pady=2, sticky="w")
+        
+        # 分项风控开关
+        self.per_trade_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="单笔交易风险限制", variable=self.per_trade_var,
+                       command=self.update_risk_config).grid(row=1, column=0, padx=20, pady=2, sticky="w")
+        
+        self.daily_loss_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="单日最大亏损限制", variable=self.daily_loss_var,
+                       command=self.update_risk_config).grid(row=2, column=0, padx=20, pady=2, sticky="w")
+        
+        self.drawdown_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="最大回撤限制", variable=self.drawdown_var,
+                       command=self.update_risk_config).grid(row=3, column=0, padx=20, pady=2, sticky="w")
+        
+        self.position_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="单一币种仓位限制", variable=self.position_var,
+                       command=self.update_risk_config).grid(row=1, column=1, padx=20, pady=2, sticky="w")
+        
+        self.price_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(risk_frame, text="价格波动异常限制", variable=self.price_var,
+                       command=self.update_risk_config).grid(row=2, column=1, padx=20, pady=2, sticky="w")
+        
+        # 紧急停止按钮
+        self.emergency_btn = ttk.Button(risk_frame, text="⚠️ 紧急停止", command=lambda: self.emergency_stop("手动触发"), 
+                                       style='Emergency.TButton')
+        self.emergency_btn.grid(row=0, column=1, rowspan=1, padx=5, pady=2, sticky="e")
         
         # 交易所选择
         exchange_frame = ttk.LabelFrame(left_frame, text="交易所选择")
