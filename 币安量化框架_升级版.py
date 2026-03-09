@@ -37,6 +37,36 @@ class TradingEngine:
         self.exchange = None
         self.okx_api = None
         
+        # ================== 风险控制模块 ==================
+        self.risk_config = {
+            # 基础风控参数
+            'max_risk_per_trade': 0.02,      # 单笔交易最大风险 2%本金
+            'max_daily_loss': 0.1,           # 单日最大亏损 10%本金
+            'max_drawdown': 0.2,             # 最大回撤 20%
+            'max_position_per_symbol': 0.3,  # 单一币种最大仓位 30%
+            'price_fluctuation_limit': 0.05, # 价格波动限制 ±5%
+            
+            # 实盘配置
+            'initial_capital': 1000.0,       # 初始资金
+            'current_capital': 1000.0,       # 当前资金
+            'peak_capital': 1000.0,          # 资金峰值
+            'daily_start_capital': 1000.0,   # 当日初始资金
+            'daily_loss': 0.0,               # 当日亏损
+            'current_drawdown': 0.0,         # 当前回撤
+            'trading_enabled': True,         # 交易开关
+            'last_trade_date': None,         # 上一次交易日期
+        }
+        
+        # 持仓信息
+        self.position = {
+            'symbol': '',
+            'side': '',  # long/short/empty
+            'size': 0.0,
+            'entry_price': 0.0,
+            'unrealized_pnl': 0.0,
+            'leverage': 5
+        }
+        
         # 公共数据
         self.symbols = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "ADAUSDT"]
         self.intervals = ["1m", "3m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
@@ -71,6 +101,118 @@ class TradingEngine:
             })
         except Exception as e:
             self.log(f"交易所初始化失败: {str(e)}")
+
+    # ================== 风险控制核心方法 ==================
+    def update_risk_metrics(self, current_price=None):
+        """更新风险指标"""
+        # 更新资金峰值和回撤
+        if self.risk_config['current_capital'] > self.risk_config['peak_capital']:
+            self.risk_config['peak_capital'] = self.risk_config['current_capital']
+        
+        if self.risk_config['peak_capital'] > 0:
+            self.risk_config['current_drawdown'] = 1 - self.risk_config['current_capital'] / self.risk_config['peak_capital']
+        
+        # 更新当日亏损
+        today = datetime.now().date()
+        if self.risk_config['last_trade_date'] != today:
+            self.risk_config['daily_start_capital'] = self.risk_config['current_capital']
+            self.risk_config['daily_loss'] = 0.0
+            self.risk_config['last_trade_date'] = today
+        else:
+            self.risk_config['daily_loss'] = 1 - self.risk_config['current_capital'] / self.risk_config['daily_start_capital']
+        
+        # 更新持仓浮盈
+        if current_price and self.position['side'] != 'empty':
+            if self.position['side'] == 'long':
+                self.position['unrealized_pnl'] = (current_price - self.position['entry_price']) * self.position['size']
+            else:  # short
+                self.position['unrealized_pnl'] = (self.position['entry_price'] - current_price) * self.position['size']
+    
+    def check_risk_limits(self, signal=None, price=None):
+        """检查风险限制，返回是否允许交易"""
+        # 全局交易开关
+        if not self.risk_config['trading_enabled']:
+            self.log("❌ 交易已被禁用，拒绝执行信号")
+            return False
+        
+        # 最大回撤检查
+        if self.risk_config['current_drawdown'] >= self.risk_config['max_drawdown']:
+            self.log(f"❌ 触发最大回撤限制: 当前回撤{self.risk_config['current_drawdown']:.2%} >= 限制{self.risk_config['max_drawdown']:.2%}")
+            self.emergency_stop("最大回撤触发")
+            return False
+        
+        # 单日最大亏损检查
+        if self.risk_config['daily_loss'] >= self.risk_config['max_daily_loss']:
+            self.log(f"❌ 触发单日最大亏损限制: 当日亏损{self.risk_config['daily_loss']:.2%} >= 限制{self.risk_config['max_daily_loss']:.2%}")
+            self.emergency_stop("单日最大亏损触发")
+            return False
+        
+        # 价格异常波动检查
+        if price and len(self.data_queue) > 1:
+            last_price = self.data_queue[-1][1]
+            fluctuation = abs(price - last_price) / last_price
+            if fluctuation >= self.risk_config['price_fluctuation_limit']:
+                self.log(f"❌ 触发价格异常波动限制: 当前波动{fluctuation:.2%} >= 限制{self.risk_config['price_fluctuation_limit']:.2%}")
+                return False
+        
+        # 开仓前检查
+        if signal in ["做多", "做空"] and self.position['side'] == 'empty':
+            # 单笔风险检查
+            position_size = self.calculate_position_size(price, signal)
+            max_allowed_size = self.risk_config['current_capital'] * self.risk_config['max_risk_per_trade'] / price
+            if position_size > max_allowed_size:
+                self.log(f"❌ 触发单笔风险限制: 计算仓位{position_size:.4f} > 最大允许{max_allowed_size:.4f}")
+                return False
+            
+            # 单一币种仓位限制
+            position_value = position_size * price
+            max_allowed_value = self.risk_config['current_capital'] * self.risk_config['max_position_per_symbol']
+            if position_value > max_allowed_value:
+                self.log(f"❌ 触发单一币种仓位限制: 仓位价值{position_value:.2f} > 最大允许{max_allowed_value:.2f}")
+                return False
+        
+        return True
+    
+    def calculate_position_size(self, price, signal):
+        """计算合适的仓位大小"""
+        # 基于风险的仓位计算
+        risk_amount = self.risk_config['current_capital'] * self.risk_config['max_risk_per_trade']
+        stop_loss_pct = 0.02  # 默认止损2%
+        position_size = risk_amount / (price * stop_loss_pct)
+        
+        # 考虑杠杆
+        position_size = position_size / self.position['leverage']
+        
+        return position_size
+    
+    def emergency_stop(self, reason=""):
+        """紧急停止交易，平仓所有持仓"""
+        self.log(f"⚠️ 执行紧急停止，原因: {reason}")
+        self.risk_config['trading_enabled'] = False
+        
+        # 平仓所有持仓
+        if self.position['side'] != 'empty':
+            close_signal = "平多" if self.position['side'] == 'long' else "平空"
+            self.log(f"⚠️ 自动平仓: {close_signal}")
+            # 执行平仓逻辑
+            self.execute_trade(close_signal, self.data_queue[-1][1] if self.data_queue else 0)
+        
+        # 发送告警
+        self.send_alert(f"紧急停止触发: {reason}", "high")
+    
+    def send_alert(self, message, level="normal"):
+        """发送告警通知"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        alert_msg = f"[{timestamp}] {'⚠️' if level == 'high' else 'ℹ️'} {message}"
+        self.log(alert_msg)
+        
+        # TODO: 集成OpenClaw消息推送，支持飞书/Telegram/邮件
+        try:
+            # 写入告警日志文件
+            with open("alerts.log", "a", encoding="utf-8") as f:
+                f.write(f"{alert_msg}\n")
+        except Exception as e:
+            self.log(f"告警写入失败: {str(e)}")
 
     def create_main_ui(self):
         # 主布局：左右分栏
@@ -381,15 +523,77 @@ class TradingEngine:
         """执行交易"""
         timestamp = datetime.now()
         
+        # 先检查风险控制
+        if not self.check_risk_limits(signal, price):
+            return
+        
+        # 更新风险指标
+        self.update_risk_metrics(price)
+        
         if signal == "做多":
-            self.log(f"开多信号触发，价格: {price}")
-            self.add_signal_marker("long", price)
+            if self.position['side'] == 'empty':
+                # 计算仓位
+                position_size = self.calculate_position_size(price, signal)
+                self.position['side'] = 'long'
+                self.position['size'] = position_size
+                self.position['entry_price'] = price
+                self.position['symbol'] = self.symbol_var.get()
+                
+                self.log(f"✅ 开多执行，价格: {price}，仓位: {position_size:.4f}")
+                self.add_signal_marker("long", price)
+                self.send_alert(f"开多 {self.symbol_var.get()} 价格: {price} 仓位: {position_size:.4f}")
+                
         elif signal == "做空":
-            self.log(f"开空信号触发，价格: {price}")
-            self.add_signal_marker("short", price)
+            if self.position['side'] == 'empty':
+                # 计算仓位
+                position_size = self.calculate_position_size(price, signal)
+                self.position['side'] = 'short'
+                self.position['size'] = position_size
+                self.position['entry_price'] = price
+                self.position['symbol'] = self.symbol_var.get()
+                
+                self.log(f"✅ 开空执行，价格: {price}，仓位: {position_size:.4f}")
+                self.add_signal_marker("short", price)
+                self.send_alert(f"开空 {self.symbol_var.get()} 价格: {price} 仓位: {position_size:.4f}")
+                
         elif signal in ["平多", "平空"]:
-            self.log(f"{signal}信号触发，价格: {price}")
-            self.add_signal_marker("close", price)
+            if (signal == "平多" and self.position['side'] == 'long') or \
+               (signal == "平空" and self.position['side'] == 'short'):
+                
+                # 计算盈亏
+                if self.position['side'] == 'long':
+                    pnl = (price - self.position['entry_price']) * self.position['size']
+                else:
+                    pnl = (self.position['entry_price'] - price) * self.position['size']
+                
+                # 更新资金
+                self.risk_config['current_capital'] += pnl
+                
+                # 记录交易
+                trade_record = {
+                    'time': timestamp.strftime("%Y-%m-%d %H:%M:%S"),
+                    'symbol': self.position['symbol'],
+                    'side': self.position['side'],
+                    'entry_price': self.position['entry_price'],
+                    'exit_price': price,
+                    'size': self.position['size'],
+                    'pnl': pnl,
+                    'pnl_pct': pnl / (self.position['entry_price'] * self.position['size']) * 100
+                }
+                self.trade_orders.append(trade_record)
+                
+                # 清空持仓
+                self.position['side'] = 'empty'
+                self.position['size'] = 0.0
+                self.position['entry_price'] = 0.0
+                self.position['unrealized_pnl'] = 0.0
+                
+                self.log(f"✅ {signal}执行，价格: {price}，盈亏: {pnl:.2f} USDT ({trade_record['pnl_pct']:.2f}%)")
+                self.add_signal_marker("close", price)
+                self.send_alert(f"{signal} {self.symbol_var.get()} 价格: {price} 盈亏: {pnl:.2f} USDT ({trade_record['pnl_pct']:.2f}%)")
+                
+                # 更新风险指标
+                self.update_risk_metrics(price)
 
     def backtest_loop(self):
         """回测循环"""
